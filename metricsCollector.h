@@ -7,6 +7,10 @@
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
+#include <thread>
+#include <chrono>
+#include <atomic>
+#include <condition_variable>
 
 #include "metric.h"
 
@@ -17,6 +21,9 @@ private:
     std::mutex fileMutex;
     std::ofstream outputFile;
     
+    std::thread workerThread;
+    std::atomic<bool> stopFlag{false};
+    
     static std::string currentTimestamp() {
         auto now = std::chrono::system_clock::now();
         auto in_time = std::chrono::system_clock::to_time_t(now);
@@ -26,34 +33,6 @@ private:
         oss << std::put_time(std::localtime(&in_time), "%F %T");
         oss << "." << std::setfill('0') << std::setw(3) << ms;
         return oss.str();
-    }
-
-public:
-    explicit MetricsCollector(const std::string &file) {
-        outputFile.open(file, std::ios::trunc);
-        if (!outputFile.is_open()) throw std::runtime_error("Cannot open metrics file");
-    }
-    
-    template<Arithmetic T>
-    void registerMetric(const std::string &name) {
-        std::unique_lock lock(metricsMutex);
-        metrics[name] = std::make_unique<Metric<T >>();
-    }
-    
-    template<Arithmetic T>
-    void setMetric(const std::string &name, T value) {
-        std::unique_lock lock(metricsMutex);
-        auto *metric = dynamic_cast<Metric<T> *>(metrics.at(name).get());
-        if (!metric) throw std::runtime_error("Metric type mismatch: " + name);
-        metric->setValue(value);
-    }
-    
-    template<Arithmetic T>
-    void incrementMetric(const std::string &name, T delta = 1) {
-        std::unique_lock lock(metricsMutex);
-        auto *metric = dynamic_cast<Metric<T> *>(metrics.at(name).get());
-        if (!metric) throw std::runtime_error("Metric type mismatch: " + name);
-        metric->increment(delta);
     }
     
     void recordAll() {
@@ -69,6 +48,55 @@ public:
         std::unique_lock lock(metricsMutex);
         for (auto &[_, metric]: metrics)
             metric->reset();
+    }
+
+public:
+    explicit MetricsCollector(const std::string &file) {
+        outputFile.open(file, std::ios::trunc);
+        if (!outputFile.is_open()) throw std::runtime_error("Cannot open metrics file");
+    }
+    
+    ~MetricsCollector() {
+        stop();
+    }
+    
+    void start() {
+        stopFlag = false;
+        workerThread = std::thread([this]() {
+            while (!stopFlag.load()) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                recordAll();
+                resetAll();
+            }
+        });
+    }
+    
+    void stop() {
+        stopFlag = true;
+        if (workerThread.joinable())
+            workerThread.join();
+    }
+    
+    template<Arithmetic T>
+    void registerMetric(const std::string &name) {
+        std::unique_lock lock(metricsMutex);
+        metrics[name] = std::make_unique<Metric<T>>();
+    }
+    
+    template<Arithmetic T>
+    void setMetric(const std::string &name, T value) {
+        std::shared_lock lock(metricsMutex);
+        auto *metric = dynamic_cast<Metric<T> *>(metrics.at(name).get());
+        if (!metric) throw std::runtime_error("Metric type mismatch: " + name);
+        metric->setValue(value);
+    }
+    
+    template<Arithmetic T>
+    void incrementMetric(const std::string &name, T delta = 1) {
+        std::shared_lock lock(metricsMutex);
+        auto *metric = dynamic_cast<Metric<T> *>(metrics.at(name).get());
+        if (!metric) throw std::runtime_error("Metric type mismatch: " + name);
+        metric->increment(delta);
     }
     
     void debugPrint() const {
